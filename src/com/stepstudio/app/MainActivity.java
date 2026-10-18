@@ -221,7 +221,7 @@ public class MainActivity extends Activity {
                 | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
         root.setSystemUiVisibility(flags);
-        root.setFitsSystemWindows(true);
+        root.setFitsSystemWindows(false);
     }
 
     private void applyInsets() {
@@ -242,7 +242,11 @@ public class MainActivity extends Activity {
                 if (top != topInset || bottom != bottomInset) {
                     topInset = top;
                     bottomInset = bottom;
-                    webView.setPadding(0, top, 0, bottom);
+                    FrameLayout.LayoutParams wl =
+                            (FrameLayout.LayoutParams) webView.getLayoutParams();
+                    wl.topMargin = top;
+                    wl.bottomMargin = bottom;
+                    webView.setLayoutParams(wl);
                     FrameLayout.LayoutParams lp =
                             (FrameLayout.LayoutParams) progressBar.getLayoutParams();
                     lp.topMargin = top;
@@ -382,7 +386,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         }
-        s.setUserAgentString(s.getUserAgentString() + " StepStudioAndroid/1.1.0");
+        s.setUserAgentString(s.getUserAgentString() + " StepStudioAndroid/1.1.1");
         s.setTextZoom(100);
 
         CookieManager cm = CookieManager.getInstance();
