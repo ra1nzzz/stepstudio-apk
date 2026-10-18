@@ -1,0 +1,5 @@
+out/
+*.jks
+*.keystore
+local.properties
+.DS_Store
