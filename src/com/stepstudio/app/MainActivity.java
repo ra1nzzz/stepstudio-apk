@@ -12,7 +12,9 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.graphics.Color;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -21,6 +23,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -28,6 +31,7 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
@@ -40,6 +44,8 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -48,10 +54,15 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
@@ -66,22 +77,38 @@ public class MainActivity extends Activity {
 
     private static final String PREFS = "stepstudio";
     private static final String KEY_LAST_CHECK = "last_update_check";
+    private static final String KEY_DL_ID = "pending_download_id";
+    private static final String KEY_DL_TAG = "pending_download_tag";
+    private static final String KEY_DL_FILE = "pending_download_file";
+
     private static final long CHECK_INTERVAL_MS = 6L * 60L * 60L * 1000L;
+    private static final long SPLASH_MIN_MS = 550L;
+    private static final long SPLASH_TIMEOUT_MS = 12000L;
 
     private WebView webView;
-    private ProgressBar progressBar;
     private FrameLayout root;
+    private FrameLayout splashView;
+    private ProgressBar progressBar;
     private TextView versionChip;
+
     private ValueCallback<Uri[]> pendingFileCallback;
     private PermissionRequest pendingPermissionRequest;
+
     private boolean pageErrorShown = false;
+    private boolean splashDismissed = false;
+    private boolean firstPageCommitted = false;
+    private long splashShownAt = 0L;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
-    private long pendingDownloadId = -1;
-    private String pendingApkUrl;
+    private final ExecutorService io = Executors.newSingleThreadExecutor();
+
+    private volatile boolean updateCheckInFlight = false;
+    private long activeDownloadId = -1L;
     private BroadcastReceiver downloadReceiver;
     private int topInset = 0;
     private int bottomInset = 0;
+
+    // ---------------- 生命周期 ----------------
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -95,7 +122,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        int barHeight = Math.max(2, (int) (2 * getResources().getDisplayMetrics().density));
+        int barHeight = Math.max(2, dp(2));
         FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, barHeight);
         pl.gravity = Gravity.TOP;
@@ -105,15 +132,19 @@ public class MainActivity extends Activity {
         root.addView(progressBar);
 
         versionChip = buildVersionChip();
+        versionChip.setVisibility(View.GONE);
         root.addView(versionChip);
+
+        splashView = buildSplash();
+        root.addView(splashView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        splashShownAt = System.currentTimeMillis();
 
         setContentView(root);
 
         applyEdgeToEdge();
         applyInsets();
-
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-
         configureWebView();
 
         if (savedInstanceState != null) {
@@ -122,30 +153,153 @@ public class MainActivity extends Activity {
             webView.loadUrl(START_URL);
         }
 
+        // 闪屏兜底：网络极差时不至于永远停在闪屏
+        ui.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                hideSplash();
+            }
+        }, SPLASH_TIMEOUT_MS);
+
+        resumePendingInstall();
         maybeAutoCheckUpdate();
     }
 
-    // ---------- 版本入口 ----------
+    private int dp(float value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    // ---------------- 闪屏 ----------------
+
+    private FrameLayout buildSplash() {
+        FrameLayout splash = new FrameLayout(this);
+        splash.setBackgroundColor(Color.WHITE);
+        splash.setClickable(true); // 挡住过渡期间的误触
+
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setGravity(Gravity.CENTER_HORIZONTAL);
+
+        ImageView logo = new ImageView(this);
+        int size = dp(84);
+        try {
+            Drawable icon = getPackageManager()
+                    .getApplicationInfo(getPackageName(), 0).loadIcon(getPackageManager());
+            logo.setImageDrawable(icon);
+        } catch (Exception ignored) {
+        }
+        column.addView(logo, new LinearLayout.LayoutParams(size, size));
+
+        TextView title = new TextView(this);
+        title.setText("Step Studio");
+        title.setTextColor(Color.parseColor("#111114"));
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f);
+        title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tl.topMargin = dp(16);
+        column.addView(title, tl);
+
+        TextView hint = new TextView(this);
+        hint.setText("正在载入工作区…");
+        hint.setTextColor(Color.parseColor("#8A8A99"));
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        LinearLayout.LayoutParams hl = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hl.topMargin = dp(7);
+        column.addView(hint, hl);
+
+        ProgressBar spinner = new ProgressBar(this);
+        LinearLayout.LayoutParams spl = new LinearLayout.LayoutParams(dp(20), dp(20));
+        spl.topMargin = dp(22);
+        column.addView(spinner, spl);
+
+        FrameLayout.LayoutParams cl = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cl.gravity = Gravity.CENTER;
+        splash.addView(column, cl);
+
+        TextView footer = new TextView(this);
+        footer.setText("网络较慢时请稍候");
+        footer.setTextColor(Color.parseColor("#B4B4C0"));
+        footer.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        FrameLayout.LayoutParams fl = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        fl.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        fl.bottomMargin = dp(48);
+        splash.addView(footer, fl);
+
+        // 闪屏是浅色底，系统栏图标切成深色，避免看不清
+        int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        root.setSystemUiVisibility(flags);
+
+        return splash;
+    }
+
+    private void showSplashAgain() {
+        if (splashView == null) return;
+        splashDismissed = false;
+        firstPageCommitted = false;
+        splashShownAt = System.currentTimeMillis();
+        splashView.setAlpha(1f);
+        splashView.setVisibility(View.VISIBLE);
+    }
+
+    private void hideSplash() {
+        if (splashDismissed || splashView == null) return;
+        splashDismissed = true;
+        long elapsed = System.currentTimeMillis() - splashShownAt;
+        long delay = Math.max(0L, SPLASH_MIN_MS - elapsed);
+        ui.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (splashView == null) return;
+                splashView.animate()
+                        .alpha(0f)
+                        .setDuration(220L)
+                        .setInterpolator(new DecelerateInterpolator())
+                        .withEndAction(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (splashView != null) {
+                                    splashView.setVisibility(View.GONE);
+                                }
+                                versionChip.setVisibility(View.VISIBLE);
+                            }
+                        })
+                        .start();
+            }
+        }, delay);
+    }
+
+    // ---------------- 版本入口 ----------------
 
     private TextView buildVersionChip() {
-        float d = getResources().getDisplayMetrics().density;
         TextView chip = new TextView(this);
         chip.setText("v" + localVersionName());
-        chip.setTextSize(10f);
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f);
         chip.setTextColor(Color.parseColor("#C8C8D8"));
-        chip.setPadding((int) (9 * d), (int) (4 * d), (int) (9 * d), (int) (4 * d));
+        chip.setPadding(dp(9), dp(4), dp(9), dp(4));
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(Color.parseColor("#66000000"));
-        bg.setCornerRadius(20 * d);
-        bg.setStroke(Math.max(1, (int) d), Color.parseColor("#33FFFFFF"));
+        bg.setCornerRadius(dp(20));
+        bg.setStroke(Math.max(1, dp(1)), Color.parseColor("#33FFFFFF"));
         chip.setBackground(bg);
         chip.setAlpha(0.6f);
 
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.gravity = Gravity.BOTTOM | Gravity.END;
-        lp.rightMargin = (int) (10 * d);
-        lp.bottomMargin = (int) (10 * d);
+        lp.rightMargin = dp(10);
+        lp.bottomMargin = dp(10);
         chip.setLayoutParams(lp);
         chip.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -157,14 +311,15 @@ public class MainActivity extends Activity {
     }
 
     private void showAboutDialog() {
-        final String menu = "版本  v" + localVersionName() + "（构建 " + localVersionCode() + "）\n"
+        if (isFinishing()) return;
+        String message = "版本  v" + localVersionName() + "（构建 " + localVersionCode() + "）\n"
                 + "包名  " + getPackageName() + "\n"
                 + "更新源  " + REPO_URL + "\n\n"
-                + "沉浸式显示 · 自动检查更新";
+                + "沉浸式显示 · 启动闪屏 · 自动检查更新";
 
         new AlertDialog.Builder(this)
                 .setTitle("Step Studio")
-                .setMessage(menu)
+                .setMessage(message)
                 .setPositiveButton("检查更新", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int w) {
@@ -174,10 +329,7 @@ public class MainActivity extends Activity {
                 .setNeutralButton("打开仓库", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int w) {
-                        try {
-                            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(REPO_URL)));
-                        } catch (Exception ignored) {
-                        }
+                        openExternal(REPO_URL);
                     }
                 })
                 .setNegativeButton("关闭", null)
@@ -205,7 +357,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- 沉浸式 ----------
+    // ---------------- 沉浸式 ----------------
 
     private void applyEdgeToEdge() {
         Window w = getWindow();
@@ -217,10 +369,6 @@ public class MainActivity extends Activity {
             w.setStatusBarContrastEnforced(false);
             w.setNavigationBarContrastEnforced(false);
         }
-        int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
-        root.setSystemUiVisibility(flags);
         root.setFitsSystemWindows(false);
     }
 
@@ -242,19 +390,21 @@ public class MainActivity extends Activity {
                 if (top != topInset || bottom != bottomInset) {
                     topInset = top;
                     bottomInset = bottom;
+
                     FrameLayout.LayoutParams wl =
                             (FrameLayout.LayoutParams) webView.getLayoutParams();
                     wl.topMargin = top;
                     wl.bottomMargin = bottom;
                     webView.setLayoutParams(wl);
-                    FrameLayout.LayoutParams lp =
+
+                    FrameLayout.LayoutParams pl =
                             (FrameLayout.LayoutParams) progressBar.getLayoutParams();
-                    lp.topMargin = top;
-                    progressBar.setLayoutParams(lp);
+                    pl.topMargin = top;
+                    progressBar.setLayoutParams(pl);
 
                     FrameLayout.LayoutParams cl =
                             (FrameLayout.LayoutParams) versionChip.getLayoutParams();
-                    cl.bottomMargin = (int) (10 * getResources().getDisplayMetrics().density) + bottom;
+                    cl.bottomMargin = dp(10) + bottom;
                     versionChip.setLayoutParams(cl);
                 }
                 return insets;
@@ -263,7 +413,6 @@ public class MainActivity extends Activity {
         root.requestApplyInsets();
     }
 
-    /** 依据网页背景色决定状态栏图标深浅，避免深色背景配深色图标看不见 */
     private void syncSystemBarTheme(String colorString) {
         int color = parseColor(colorString, Color.parseColor("#0B0B0F"));
         root.setBackgroundColor(color);
@@ -301,7 +450,6 @@ public class MainActivity extends Activity {
         try {
             if (s.startsWith("#")) {
                 if (s.length() == 9) {
-                    // #aarrggbb
                     return Color.parseColor("#" + s.substring(3));
                 }
                 return Color.parseColor(s);
@@ -312,14 +460,14 @@ public class MainActivity extends Activity {
                 if (start > 0 && end > start) {
                     String[] parts = s.substring(start + 1, end).split(",");
                     if (parts.length >= 3) {
-                        int r = (int) Float.parseFloat(parts[0].trim());
-                        int g = (int) Float.parseFloat(parts[1].trim());
-                        int b = (int) Float.parseFloat(parts[2].trim());
+                        int r = clamp((int) Float.parseFloat(parts[0].trim()));
+                        int g = clamp((int) Float.parseFloat(parts[1].trim()));
+                        int b = clamp((int) Float.parseFloat(parts[2].trim()));
                         if (parts.length >= 4) {
                             float a = Float.parseFloat(parts[3].trim());
                             if (a <= 0.01f) return fallback;
                         }
-                        return Color.rgb(clamp(r), clamp(g), clamp(b));
+                        return Color.rgb(r, g, b);
                     }
                 }
             }
@@ -332,22 +480,12 @@ public class MainActivity extends Activity {
         return v < 0 ? 0 : (v > 255 ? 255 : v);
     }
 
-    // ---------- WebView ----------
+    // ---------------- WebView ----------------
 
     public class HostBridge {
         @JavascriptInterface
         public void onTheme(String background) {
             syncSystemBarTheme(background);
-        }
-
-        @JavascriptInterface
-        public void onReady() {
-            runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    versionChip.setVisibility(View.VISIBLE);
-                }
-            });
         }
     }
 
@@ -386,7 +524,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         }
-        s.setUserAgentString(s.getUserAgentString() + " StepStudioAndroid/1.1.1");
+        s.setUserAgentString(s.getUserAgentString() + " StepStudioAndroid/1.1.2");
         s.setTextZoom(100);
 
         CookieManager cm = CookieManager.getInstance();
@@ -412,9 +550,26 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                if (pageErrorShown && START_URL.equals(url)) {
+                    pageErrorShown = false;
+                    showSplashAgain();
+                }
+            }
+
+            @Override
+            public void onPageCommitVisible(WebView view, String url) {
+                if (!firstPageCommitted) {
+                    firstPageCommitted = true;
+                    hideSplash();
+                }
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
                 view.evaluateJavascript(THEME_PROBE_JS, null);
+                hideSplash();
             }
 
             @Override
@@ -422,6 +577,7 @@ public class MainActivity extends Activity {
                 if (!pageErrorShown) {
                     pageErrorShown = true;
                     progressBar.setVisibility(View.GONE);
+                    hideSplash();
                     view.loadDataWithBaseURL(null, errorHtml(description),
                             "text/html", "utf-8", null);
                 }
@@ -508,21 +664,27 @@ public class MainActivity extends Activity {
             return false;
         }
         if (!isInternalUrl(url)) {
-            try {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-            } catch (Exception ignored) {
-            }
+            openExternal(url);
             return true;
         }
         return false;
     }
 
-    private boolean hasAudioPermission() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true;
-        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    private void openExternal(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (Exception ignored) {
+        }
     }
 
-    private void downloadWithSystem(String url, String userAgent, String contentDisposition, String mimeType) {
+    private boolean hasAudioPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true;
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void downloadWithSystem(String url, String userAgent, String contentDisposition,
+                                    String mimeType) {
         try {
             String fileName = URLUtil.guessFileName(url, contentDisposition, mimeType);
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
@@ -542,30 +704,37 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------- 更新 ----------
+    // ---------------- OTA 更新 ----------------
+
+    private SharedPreferences prefs() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
 
     private void maybeAutoCheckUpdate() {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        long last = sp.getLong(KEY_LAST_CHECK, 0L);
+        long last = prefs().getLong(KEY_LAST_CHECK, 0L);
         if (System.currentTimeMillis() - last < CHECK_INTERVAL_MS) return;
-        sp.edit().putLong(KEY_LAST_CHECK, System.currentTimeMillis()).apply();
         ui.postDelayed(new Runnable() {
             @Override
             public void run() {
                 checkUpdate(false);
             }
-        }, 2500);
+        }, 2500L);
     }
 
     private void checkUpdate(final boolean manual) {
+        if (updateCheckInFlight) {
+            if (manual) toast("正在检查更新…");
+            return;
+        }
+        updateCheckInFlight = true;
         if (manual) toast("正在检查更新…");
-        new Thread(new Runnable() {
+
+        io.execute(new Runnable() {
             @Override
             public void run() {
                 HttpURLConnection conn = null;
                 try {
-                    URL url = new URL(RELEASES_API);
-                    conn = (HttpURLConnection) url.openConnection();
+                    conn = (HttpURLConnection) new URL(RELEASES_API).openConnection();
                     conn.setConnectTimeout(8000);
                     conn.setReadTimeout(10000);
                     conn.setRequestProperty("Accept", "application/vnd.github+json");
@@ -574,9 +743,8 @@ public class MainActivity extends Activity {
                     if (code != 200) {
                         throw new IllegalStateException("HTTP " + code);
                     }
-                    String body = readStream(conn.getInputStream());
-                    JSONObject json = new JSONObject(body);
-                    String tag = json.optString("tag_name", "");
+                    JSONObject json = new JSONObject(readStream(conn.getInputStream()));
+                    final String tag = json.optString("tag_name", "");
                     String apkUrl = null;
                     String apkName = null;
                     JSONArray assets = json.optJSONArray("assets");
@@ -591,14 +759,23 @@ public class MainActivity extends Activity {
                             }
                         }
                     }
+
                     final String fTag = tag;
                     final String fUrl = apkUrl;
                     final String fName = apkName;
-                    final boolean newer = apkUrl != null && compareVersion(tag, localVersionName()) > 0;
+                    final boolean newer =
+                            apkUrl != null && compareVersion(tag, localVersionName()) > 0;
+
+                    // 只有成功命中才记时间，失败下次仍会重试
+                    prefs().edit()
+                            .putLong(KEY_LAST_CHECK, System.currentTimeMillis())
+                            .apply();
 
                     ui.post(new Runnable() {
                         @Override
                         public void run() {
+                            updateCheckInFlight = false;
+                            if (isFinishing()) return;
                             if (newer) {
                                 onUpdateAvailable(fTag, fUrl, fName, manual);
                             } else if (manual) {
@@ -610,26 +787,29 @@ public class MainActivity extends Activity {
                     ui.post(new Runnable() {
                         @Override
                         public void run() {
-                            if (manual) toast("检查更新失败：" + e.getClass().getSimpleName());
+                            updateCheckInFlight = false;
+                            if (manual && !isFinishing()) {
+                                toast("检查更新失败：" + e.getClass().getSimpleName());
+                            }
                         }
                     });
                 } finally {
                     if (conn != null) conn.disconnect();
                 }
             }
-        }).start();
+        });
     }
 
     private void onUpdateAvailable(final String tag, final String apkUrl, final String apkName,
                                    boolean manual) {
         if (!manual) {
-            // 自动更新：静默下载，下载完成后提示安装
             startApkDownload(apkUrl, apkName, tag, true);
             return;
         }
         new AlertDialog.Builder(this)
                 .setTitle("发现新版本 " + tag)
-                .setMessage("当前版本 v" + localVersionName() + "，最新版本 " + tag + "。\n\n是否立即下载更新？")
+                .setMessage("当前版本 v" + localVersionName() + "，最新版本 " + tag
+                        + "。\n\n是否立即下载更新？")
                 .setPositiveButton("立即更新", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int w) {
@@ -640,22 +820,57 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    private void startApkDownload(String apkUrl, String apkName, String tag, final boolean silent) {
+    private File updateDir() {
+        File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) {
+            dir = new File(getFilesDir(), "updates");
+        }
+        if (!dir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+        }
+        return dir;
+    }
+
+    private void startApkDownload(String apkUrl, String apkName, final String tag,
+                                  final boolean silent) {
         try {
-            String fileName = TextUtils.isEmpty(apkName) ? "StepStudio-" + tag + ".apk" : apkName;
+            final String fileName = TextUtils.isEmpty(apkName)
+                    ? "StepStudio-" + tag + ".apk" : apkName;
+            cleanOldUpdates(fileName);
+
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(apkUrl));
             req.setTitle("Step Studio " + tag);
             req.setDescription("正在下载新版本");
             req.setMimeType("application/vnd.android.package-archive");
             req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
             req.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, fileName);
+
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-            pendingApkUrl = apkUrl;
-            pendingDownloadId = dm.enqueue(req);
+            long id = dm.enqueue(req);
+            activeDownloadId = id;
+            prefs().edit()
+                    .putLong(KEY_DL_ID, id)
+                    .putString(KEY_DL_TAG, tag)
+                    .putString(KEY_DL_FILE, fileName)
+                    .apply();
             registerDownloadReceiver();
-            toast(silent ? ("发现新版本 " + tag + "，正在后台下载") : "开始下载 " + tag);
+            toast(silent ? ("发现新版本 " + tag + "，正在后台下载") : ("开始下载 " + tag));
         } catch (Exception e) {
             toast("更新下载失败：" + e.getMessage());
+        }
+    }
+
+    private void cleanOldUpdates(String keepName) {
+        File dir = updateDir();
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File f : files) {
+            if (f.isFile() && f.getName().toLowerCase(Locale.US).endsWith(".apk")
+                    && !f.getName().equals(keepName)) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            }
         }
     }
 
@@ -664,50 +879,145 @@ public class MainActivity extends Activity {
         downloadReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
-                if (pendingDownloadId != -1 && id == pendingDownloadId) {
-                    onUpdateDownloaded();
+                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+                long expected = prefs().getLong(KEY_DL_ID, -1L);
+                if (expected != -1L && id == expected) {
+                    onUpdateDownloaded(id);
                 }
             }
         };
         IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
         if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(downloadReceiver, filter, Context.RECEIVER_EXPORTED);
+            // 系统广播，使用 NOT_EXPORTED 防止第三方伪造下载完成
+            registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(downloadReceiver, filter);
         }
     }
 
-    private void onUpdateDownloaded() {
-        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-        Uri apkUri;
-        try {
-            apkUri = dm.getUriForDownloadedFile(pendingDownloadId);
-        } catch (Exception e) {
-            apkUri = null;
-        }
-        if (apkUri == null) {
-            toast("更新包下载失败，请到应用内重试");
-            return;
-        }
-        final Uri uri = apkUri;
-        new AlertDialog.Builder(this)
-                .setTitle("新版本已就绪")
-                .setMessage("更新包已下载完成。点击「立即安装」后，请在系统弹窗中确认安装。")
-                .setPositiveButton("立即安装", new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface d, int w) {
-                        installApk(uri);
+    /** 应用重启后继续处理已完成的下载 */
+    private void resumePendingInstall() {
+        final long id = prefs().getLong(KEY_DL_ID, -1L);
+        if (id == -1L) return;
+        activeDownloadId = id;
+        registerDownloadReceiver();
+        io.execute(new Runnable() {
+            @Override
+            public void run() {
+                DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+                DownloadManager.Query q = new DownloadManager.Query().setFilterById(id);
+                android.database.Cursor c = null;
+                try {
+                    c = dm.query(q);
+                    if (c != null && c.moveToFirst()) {
+                        int status = c.getInt(c.getColumnIndex(DownloadManager.COLUMN_STATUS));
+                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                            ui.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    onUpdateDownloaded(id);
+                                }
+                            });
+                        } else if (status == DownloadManager.STATUS_FAILED) {
+                            clearPendingDownload();
+                        }
+                    } else {
+                        clearPendingDownload();
                     }
-                })
-                .setNegativeButton("稍后", null)
-                .show();
+                } catch (Exception ignored) {
+                } finally {
+                    if (c != null) c.close();
+                }
+            }
+        });
     }
 
-    private void installApk(Uri apkUri) {
+    private void clearPendingDownload() {
+        prefs().edit()
+                .remove(KEY_DL_ID)
+                .remove(KEY_DL_TAG)
+                .remove(KEY_DL_FILE)
+                .apply();
+        activeDownloadId = -1L;
+    }
+
+    private void onUpdateDownloaded(final long downloadId) {
+        final String fileName = prefs().getString(KEY_DL_FILE, null);
+        final String tag = prefs().getString(KEY_DL_TAG, "");
+        if (TextUtils.isEmpty(fileName)) {
+            clearPendingDownload();
+            return;
+        }
+        io.execute(new Runnable() {
+            @Override
+            public void run() {
+                final File apk = new File(updateDir(), fileName);
+                final boolean ok = apk.exists() && verifiedSameSigner(apk);
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isFinishing()) return;
+                        if (!ok) {
+                            clearPendingDownload();
+                            //noinspection ResultOfMethodCallIgnored
+                            apk.delete();
+                            toast("更新包校验失败，请到仓库重新下载");
+                            return;
+                        }
+                        new AlertDialog.Builder(MainActivity.this)
+                                .setTitle("新版本已就绪 " + tag)
+                                .setMessage("更新包已下载并通过签名校验。点击「立即安装」后，请在系统弹窗中确认安装。")
+                                .setPositiveButton("立即安装", new DialogInterface.OnClickListener() {
+                                    @Override
+                                    public void onClick(DialogInterface d, int w) {
+                                        installApk(downloadId);
+                                    }
+                                })
+                                .setNegativeButton("稍后", null)
+                                .show();
+                    }
+                });
+            }
+        });
+    }
+
+    /** 校验下载包的包名与签名，二者必须与本应用完全一致才允许安装 */
+    private boolean verifiedSameSigner(File apkFile) {
         try {
+            PackageManager pm = getPackageManager();
+            PackageInfo archive = pm.getPackageArchiveInfo(apkFile.getAbsolutePath(),
+                    PackageManager.GET_SIGNATURES);
+            if (archive == null || !getPackageName().equals(archive.packageName)) return false;
+            Signature[] remote = archive.signatures;
+            Signature[] local = pm.getPackageInfo(getPackageName(),
+                    PackageManager.GET_SIGNATURES).signatures;
+            if (remote == null || local == null || remote.length == 0 || local.length == 0) {
+                return false;
+            }
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] a = digest.digest(remote[0].toByteArray());
+            byte[] b = digest.digest(local[0].toByteArray());
+            return Arrays.equals(a, b);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void installApk(long downloadId) {
+        try {
+            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            Uri uri = dm.getUriForDownloadedFile(downloadId);
+            if (uri == null) {
+                File apk = new File(updateDir(), prefs().getString(KEY_DL_FILE, ""));
+                if (!apk.exists()) {
+                    toast("安装包不存在，请重试");
+                    return;
+                }
+                toast("请到文件管理安装下载目录中的更新包");
+                return;
+            }
             Intent i = new Intent(Intent.ACTION_VIEW);
-            i.setDataAndType(apkUri, "application/vnd.android.package-archive");
+            i.setDataAndType(uri, "application/vnd.android.package-archive");
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(i);
         } catch (Exception e) {
@@ -715,7 +1025,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 比较 v1.2.3 形式的版本号，remote > local 返回正数 */
     private static int compareVersion(String remote, String local) {
         int[] a = parseVersion(remote);
         int[] b = parseVersion(local);
@@ -766,7 +1075,7 @@ public class MainActivity extends Activity {
         Toast.makeText(this, text, Toast.LENGTH_SHORT).show();
     }
 
-    // ---------- 生命周期 ----------
+    // ---------------- 回调与生命周期 ----------------
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -793,7 +1102,8 @@ public class MainActivity extends Activity {
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                           int[] grantResults) {
         if (requestCode == REQ_AUDIO_PERM && pendingPermissionRequest != null) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
@@ -838,6 +1148,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacksAndMessages(null);
         if (downloadReceiver != null) {
             try {
                 unregisterReceiver(downloadReceiver);
@@ -845,6 +1156,7 @@ public class MainActivity extends Activity {
             }
             downloadReceiver = null;
         }
+        io.shutdownNow();
         if (webView != null) {
             webView.removeJavascriptInterface("StepStudioHost");
             webView.setWebChromeClient(null);
