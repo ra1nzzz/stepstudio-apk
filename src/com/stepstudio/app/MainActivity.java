@@ -44,6 +44,7 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -71,6 +72,9 @@ public class MainActivity extends Activity {
     private static final String RELEASES_API =
             "https://api.github.com/repos/ra1nzzz/stepstudio-apk/releases/latest";
     private static final String REPO_URL = "https://github.com/ra1nzzz/stepstudio-apk";
+    /** 含预发布版本的列表，用于测试包直装 */
+    private static final String RELEASES_LIST_API =
+            "https://api.github.com/repos/ra1nzzz/stepstudio-apk/releases?per_page=10";
     private static final String[] INTERNAL_HOSTS = {"stepx.com", "stepfun.com"};
 
     private static final int REQ_FILE_CHOOSER = 1001;
@@ -315,6 +319,13 @@ public class MainActivity extends Activity {
                 showAboutDialog();
             }
         });
+        chip.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                showInstallEntryDialog();
+                return true;
+            }
+        });
         return chip;
     }
 
@@ -323,7 +334,8 @@ public class MainActivity extends Activity {
         String message = "版本  v" + localVersionName() + "（构建 " + localVersionCode() + "）\n"
                 + "包名  " + getPackageName() + "\n"
                 + "更新源  " + REPO_URL + "\n\n"
-                + "沉浸式显示 · 启动闪屏 · 自动检查更新";
+                + "沉浸式显示 · 启动闪屏 · 自动检查更新\n"
+                + "长按版本胶囊可打开直装入口";
 
         new AlertDialog.Builder(this)
                 .setTitle("Step Studio")
@@ -341,6 +353,149 @@ public class MainActivity extends Activity {
                     }
                 })
                 .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    /** 长按版本胶囊打开：正式版 / 测试包 / 自定义地址 三个直装入口 */
+    private void showInstallEntryDialog() {
+        if (isFinishing()) return;
+        final String[] items = {
+                "正式版：下载最新 Release 并安装",
+                "测试包：下载最新构建（含预发布）并安装",
+                "自定义地址：粘贴任意 APK 链接"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("直装入口")
+                .setItems(items, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        if (which == 0) {
+                            installFromChannel(0);
+                        } else if (which == 1) {
+                            installFromChannel(1);
+                        } else {
+                            showCustomUrlDialog();
+                        }
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /**
+     * 拉取指定渠道的最新安装包并直接下载安装。
+     * channel = 0：正式版（releases/latest，不含预发布）；channel = 1：测试包（releases 列表首个，可能是预发布）
+     */
+    private void installFromChannel(final int channel) {
+        if (updateCheckInFlight) {
+            toast("正在获取版本信息…");
+            return;
+        }
+        if (!ensureInstallPermission()) return;
+        updateCheckInFlight = true;
+        toast(channel == 1 ? "正在获取最新测试包…" : "正在获取最新正式版…");
+
+        io.execute(new Runnable() {
+            @Override
+            public void run() {
+                HttpURLConnection conn = null;
+                try {
+                    String endpoint = channel == 1 ? RELEASES_LIST_API : RELEASES_API;
+                    conn = (HttpURLConnection) new URL(endpoint).openConnection();
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(10000);
+                    conn.setRequestProperty("Accept", "application/vnd.github+json");
+                    conn.setRequestProperty("User-Agent", "StepStudioAndroid");
+                    int code = conn.getResponseCode();
+                    if (code != 200) throw new IllegalStateException("HTTP " + code);
+
+                    String body = readStream(conn.getInputStream());
+                    JSONObject release;
+                    if (channel == 1) {
+                        JSONArray list = new JSONArray(body);
+                        release = list.optJSONObject(0);
+                    } else {
+                        release = new JSONObject(body);
+                    }
+                    if (release == null) throw new IllegalStateException("无可用版本");
+
+                    final String tag = release.optString("tag_name", "");
+                    String apkUrl = null;
+                    String apkName = null;
+                    JSONArray assets = release.optJSONArray("assets");
+                    if (assets != null) {
+                        for (int i = 0; i < assets.length(); i++) {
+                            JSONObject a = assets.getJSONObject(i);
+                            String name = a.optString("name", "");
+                            if (name.toLowerCase(Locale.US).endsWith(".apk")) {
+                                apkUrl = a.optString("browser_download_url", null);
+                                apkName = name;
+                                break;
+                            }
+                        }
+                    }
+                    if (apkUrl == null) throw new IllegalStateException("该版本没有 apk 资产");
+
+                    final String fUrl = apkUrl;
+                    final String fName = apkName;
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            updateCheckInFlight = false;
+                            if (isFinishing()) return;
+                            if (channel == 1) {
+                                toast("测试包 " + tag + " 开始下载");
+                            }
+                            startApkDownload(fUrl, fName, tag, false);
+                        }
+                    });
+                } catch (final Exception e) {
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            updateCheckInFlight = false;
+                            if (!isFinishing()) {
+                                toast("获取版本失败：" + e.getClass().getSimpleName());
+                            }
+                        }
+                    });
+                } finally {
+                    if (conn != null) conn.disconnect();
+                }
+            }
+        });
+    }
+
+    /** 自定义 APK 地址直装：粘贴链接即可下载并安装 */
+    private void showCustomUrlDialog() {
+        final EditText input = new EditText(this);
+        input.setHint("https://…/StepStudio.apk");
+        input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        input.setSingleLine(true);
+
+        FrameLayout wrap = new FrameLayout(this);
+        int pad = dp(18);
+        wrap.setPadding(pad, dp(6), pad, 0);
+        wrap.addView(input, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+                .setTitle("自定义安装包地址")
+                .setView(wrap)
+                .setPositiveButton("下载并安装", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        String url = input.getText().toString().trim();
+                        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                            toast("请填写完整的 http(s) 地址");
+                            return;
+                        }
+                        if (!ensureInstallPermission()) return;
+                        String name = "StepStudio-test-" + System.currentTimeMillis() + ".apk";
+                        startApkDownload(url, name, "测试包", false);
+                    }
+                })
+                .setNegativeButton("取消", null)
                 .show();
     }
 
