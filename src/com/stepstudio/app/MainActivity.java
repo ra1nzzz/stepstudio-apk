@@ -5,6 +5,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
@@ -116,6 +118,8 @@ public class MainActivity extends Activity {
 
     private volatile boolean updateCheckInFlight = false;
     private long activeDownloadId = -1L;
+    private boolean pendingIsTestPackage = false;
+    private String detectedApkUrl = null;
     private BroadcastReceiver downloadReceiver;
     private int topInset = 0;
     private int bottomInset = 0;
@@ -362,6 +366,7 @@ public class MainActivity extends Activity {
         final String[] items = {
                 "正式版：下载最新 Release 并安装",
                 "测试包：下载最新构建（含预发布）并安装",
+                "安装测试包：读页面链接或剪贴板链接",
                 "自定义地址：粘贴任意 APK 链接"
         };
         new AlertDialog.Builder(this)
@@ -373,6 +378,8 @@ public class MainActivity extends Activity {
                             installFromChannel(0);
                         } else if (which == 1) {
                             installFromChannel(1);
+                        } else if (which == 2) {
+                            installTestPackage();
                         } else {
                             showCustomUrlDialog();
                         }
@@ -443,6 +450,7 @@ public class MainActivity extends Activity {
                         public void run() {
                             updateCheckInFlight = false;
                             if (isFinishing()) return;
+                            pendingIsTestPackage = false;
                             if (channel == 1) {
                                 toast("测试包 " + tag + " 开始下载");
                             }
@@ -464,6 +472,46 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    /**
+     * 安装测试包：优先用页面里嗅探到的 apk 链接，其次读剪贴板（对应构建器「一键复制链接」）。
+     * 测试包是另一个应用，不做同签名校验，只校验下载结果确实是合法 APK。
+     */
+    private void installTestPackage() {
+        String url = detectedApkUrl;
+        String source = "页面链接";
+        if (TextUtils.isEmpty(url)) {
+            url = readClipboardText();
+            source = "剪贴板链接";
+        }
+        if (TextUtils.isEmpty(url)) {
+            toast("没找到测试包链接，请先在真机测试面板点「一键复制链接」");
+            return;
+        }
+        url = url.trim();
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            toast("链接格式不支持：" + url);
+            return;
+        }
+        if (!ensureInstallPermission()) return;
+        pendingIsTestPackage = true;
+        String name = "StepStudio-test-" + System.currentTimeMillis() + ".apk";
+        startApkDownload(url, name, "测试包", false);
+        toast("已从" + source + "读取，开始下载测试包");
+    }
+
+    private String readClipboardText() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return null;
+            ClipData clip = cm.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return null;
+            CharSequence text = clip.getItemAt(0).coerceToText(this);
+            return text == null ? null : text.toString();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** 自定义 APK 地址直装：粘贴链接即可下载并安装 */
@@ -491,6 +539,7 @@ public class MainActivity extends Activity {
                             return;
                         }
                         if (!ensureInstallPermission()) return;
+                        pendingIsTestPackage = false;
                         String name = "StepStudio-test-" + System.currentTimeMillis() + ".apk";
                         startApkDownload(url, name, "测试包", false);
                     }
@@ -650,7 +699,35 @@ public class MainActivity extends Activity {
         public void onTheme(String background) {
             syncSystemBarTheme(background);
         }
+
+        /** 页面里出现 .apk 链接时上报，供「安装测试包」一键直装 */
+        @JavascriptInterface
+        public void onApkLink(final String url) {
+            if (url == null || url.length() == 0) return;
+            if (url.equals(detectedApkUrl)) return;
+            detectedApkUrl = url;
+            ui.post(new Runnable() {
+                @Override
+                public void run() {
+                    toast("已捕获测试包链接，长按版本胶囊可直接安装");
+                }
+            });
+        }
     }
+
+    private static final String APK_SNIFF_JS =
+            "(function(){if(window.__ssSniff)return;window.__ssSniff=1;var last='';"
+            + "function scan(){try{var urls=[];"
+            + "var as=document.querySelectorAll('a[href]');"
+            + "for(var i=0;i<as.length;i++){var h=as[i].href||'';"
+            + "if(/\\.apk(\\?|$)/i.test(h))urls.push(h);}"
+            + "var t=(document.body&&document.body.innerText)||'';"
+            + "var m=t.match(/https?:\\/\\/[^\\s\"'<>]+\\.apk[^\\s\"'<>]*/ig);"
+            + "if(m)urls=urls.concat(m);"
+            + "if(urls.length&&urls[0]!==last){last=urls[0];"
+            + "if(window.StepStudioHost&&window.StepStudioHost.onApkLink)"
+            + "window.StepStudioHost.onApkLink(last);}}catch(e){}}"
+            + "scan();setInterval(scan,2500);})();";
 
     private static final String THEME_PROBE_JS =
             "(function(){"
@@ -732,6 +809,7 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
                 view.evaluateJavascript(THEME_PROBE_JS, null);
+                view.evaluateJavascript(APK_SNIFF_JS, null);
                 hideSplash();
             }
 
@@ -966,6 +1044,7 @@ public class MainActivity extends Activity {
 
     private void onUpdateAvailable(final String tag, final String apkUrl, final String apkName,
                                    boolean manual, boolean forceInstall) {
+        pendingIsTestPackage = false;
         if (!manual) {
             startApkDownload(apkUrl, apkName, tag, true);
             return;
@@ -1184,7 +1263,18 @@ public class MainActivity extends Activity {
             public void run() {
                 final boolean failed = downloadFailed(downloadId);
                 final File apk = new File(updateDir(), fileName);
-                final boolean ok = !failed && apk.exists() && verifiedSameSigner(apk);
+                final boolean isTest = pendingIsTestPackage;
+                PackageInfo testInfo = null;
+                boolean ok;
+                if (isTest) {
+                    testInfo = apk.exists()
+                            ? getPackageManager().getPackageArchiveInfo(apk.getAbsolutePath(), 0)
+                            : null;
+                    ok = !failed && testInfo != null;
+                } else {
+                    ok = !failed && apk.exists() && verifiedSameSigner(apk);
+                }
+                final PackageInfo fTestInfo = testInfo;
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
@@ -1196,14 +1286,19 @@ public class MainActivity extends Activity {
                                 retryWithNextMirror();
                             } else {
                                 clearPendingDownload();
-                                toast("更新包校验失败，已拦截安装");
+                                toast(isTest ? "下载内容不是有效安装包，已拦截" : "更新包校验失败，已拦截安装");
                             }
                             return;
                         }
                         prefs().edit().putInt(KEY_DL_MIRROR, 0).apply();
+                        String title = isTest ? "测试包已就绪 " + tag : "新版本已就绪 " + tag;
+                        String body = isTest
+                                ? ("已下载 " + (fTestInfo == null ? "安装包" : fTestInfo.packageName)
+                                + "，点击「立即安装」后在系统弹窗中确认。")
+                                : "更新包已下载并通过签名校验。点击「立即安装」后，请在系统弹窗中确认安装。";
                         new AlertDialog.Builder(MainActivity.this)
-                                .setTitle("新版本已就绪 " + tag)
-                                .setMessage("更新包已下载并通过签名校验。点击「立即安装」后，请在系统弹窗中确认安装。")
+                                .setTitle(title)
+                                .setMessage(body)
                                 .setPositiveButton("立即安装", new DialogInterface.OnClickListener() {
                                     @Override
                                     public void onClick(DialogInterface d, int w) {
