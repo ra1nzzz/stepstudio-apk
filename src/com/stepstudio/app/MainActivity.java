@@ -26,6 +26,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.TypedValue;
@@ -1182,9 +1183,12 @@ public class MainActivity extends Activity {
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(finalUrl));
             req.setTitle("Step Studio " + tag);
             req.setDescription("正在下载新版本");
-            req.setMimeType("application/vnd.android.package-archive");
-            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
-            req.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, fileName);
+            req.setMimeType(APK_MIME);
+            req.setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            // 落到公共「下载」目录：状态栏通知点开能直接装，文件管理里也看得到
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
+            req.setVisibleInDownloadsUi(true);
 
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
             long id = dm.enqueue(req);
@@ -1354,6 +1358,10 @@ public class MainActivity extends Activity {
             public void run() {
                 final boolean failed = downloadFailed(downloadId);
                 final File apk = new File(updateDir(), fileName);
+                if (!failed) {
+                    // DownloadManager 的包在公共下载目录，复制一份到私有目录再校验/安装
+                    mirrorDownloadedFile(downloadId, apk);
+                }
                 final boolean isTest = pendingIsTestPackage;
                 PackageInfo testInfo = null;
                 boolean ok;
@@ -1402,6 +1410,45 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    /**
+     * 把 DownloadManager 下载好的文件复制到应用私有目录。
+     * 走 openDownloadedFile 拿到 fd，不依赖存储权限，也不用猜公共目录路径。
+     */
+    private boolean mirrorDownloadedFile(long downloadId, File target) {
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        ParcelFileDescriptor pfd = null;
+        FileInputStream in = null;
+        OutputStream out = null;
+        try {
+            pfd = dm.openDownloadedFile(downloadId);
+            if (pfd == null) return false;
+            in = new FileInputStream(pfd.getFileDescriptor());
+            out = new FileOutputStream(target);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+            return target.length() > 0;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            try {
+                if (in != null) in.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                if (out != null) out.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                if (pfd != null) pfd.close();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private boolean downloadFailed(long downloadId) {
