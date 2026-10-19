@@ -104,6 +104,7 @@ public class MainActivity extends Activity {
     private FrameLayout splashView;
     private ProgressBar progressBar;
     private TextView versionChip;
+    private TextView testChip;
 
     private ValueCallback<Uri[]> pendingFileCallback;
     private PermissionRequest pendingPermissionRequest;
@@ -150,6 +151,10 @@ public class MainActivity extends Activity {
         versionChip = buildVersionChip();
         versionChip.setVisibility(View.GONE);
         root.addView(versionChip);
+
+        testChip = buildTestChip();
+        testChip.setVisibility(View.GONE);
+        root.addView(testChip);
 
         splashView = buildSplash();
         root.addView(splashView, new FrameLayout.LayoutParams(
@@ -333,6 +338,59 @@ public class MainActivity extends Activity {
         return chip;
     }
 
+    /** 页面里出现测试包链接时浮现的独立按钮，不挂在版本胶囊上 */
+    private TextView buildTestChip() {
+        TextView chip = new TextView(this);
+        chip.setText("装测试包");
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        chip.setTextColor(Color.WHITE);
+        chip.setPadding(dp(12), dp(7), dp(12), dp(7));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.parseColor("#E62F6FED"));
+        bg.setCornerRadius(dp(20));
+        chip.setBackground(bg);
+        chip.setElevation(dp(4));
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.BOTTOM | Gravity.END;
+        lp.rightMargin = dp(10);
+        lp.bottomMargin = dp(46);
+        chip.setLayoutParams(lp);
+        chip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                installTestPackage();
+            }
+        });
+        return chip;
+    }
+
+    private void showTestChip() {
+        if (testChip == null) return;
+        testChip.animate().cancel();
+        testChip.setVisibility(View.VISIBLE);
+        testChip.setAlpha(0f);
+        testChip.animate().alpha(1f).setDuration(160).start();
+    }
+
+    private void hideTestChip() {
+        if (testChip == null) return;
+        testChip.setVisibility(View.GONE);
+    }
+
+    /** 页面没有 apk 链接时，看看剪贴板里有没有构建器「一键复制链接」留下的地址 */
+    private void checkClipboardForApk() {
+        if (detectedApkUrl != null) return;
+        final String text = readClipboardText();
+        if (text == null) return;
+        final String url = text.trim();
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return;
+        if (url.toLowerCase(Locale.US).indexOf(".apk") < 0) return;
+        detectedApkUrl = url;
+        showTestChip();
+    }
+
     private void showAboutDialog() {
         if (isFinishing()) return;
         String message = "版本  v" + localVersionName() + "（构建 " + localVersionCode() + "）\n"
@@ -366,7 +424,6 @@ public class MainActivity extends Activity {
         final String[] items = {
                 "正式版：下载最新 Release 并安装",
                 "测试包：下载最新构建（含预发布）并安装",
-                "安装测试包：读页面链接或剪贴板链接",
                 "自定义地址：粘贴任意 APK 链接"
         };
         new AlertDialog.Builder(this)
@@ -378,8 +435,6 @@ public class MainActivity extends Activity {
                             installFromChannel(0);
                         } else if (which == 1) {
                             installFromChannel(1);
-                        } else if (which == 2) {
-                            installTestPackage();
                         } else {
                             showCustomUrlDialog();
                         }
@@ -496,6 +551,7 @@ public class MainActivity extends Activity {
         }
         if (!ensureInstallPermission()) return;
         pendingIsTestPackage = true;
+        hideTestChip();
         String name = "StepStudio-test-" + System.currentTimeMillis() + ".apk";
         startApkDownload(url, name, "测试包", false);
         toast("已从" + source + "读取，开始下载测试包");
@@ -618,6 +674,13 @@ public class MainActivity extends Activity {
                             (FrameLayout.LayoutParams) versionChip.getLayoutParams();
                     cl.bottomMargin = dp(10) + bottom;
                     versionChip.setLayoutParams(cl);
+
+                    if (testChip != null) {
+                        FrameLayout.LayoutParams tl =
+                                (FrameLayout.LayoutParams) testChip.getLayoutParams();
+                        tl.bottomMargin = dp(44) + bottom;
+                        testChip.setLayoutParams(tl);
+                    }
                 }
                 return insets;
             }
@@ -709,7 +772,8 @@ public class MainActivity extends Activity {
             ui.post(new Runnable() {
                 @Override
                 public void run() {
-                    toast("已捕获测试包链接，长按版本胶囊可直接安装");
+                    showTestChip();
+                    toast("检测到测试包，点右下角「装测试包」直接安装");
                 }
             });
         }
@@ -810,6 +874,12 @@ public class MainActivity extends Activity {
                 progressBar.setVisibility(View.GONE);
                 view.evaluateJavascript(THEME_PROBE_JS, null);
                 view.evaluateJavascript(APK_SNIFF_JS, null);
+                ui.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        checkClipboardForApk();
+                    }
+                }, 1200L);
                 hideSplash();
             }
 
