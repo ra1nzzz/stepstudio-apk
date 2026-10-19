@@ -30,8 +30,9 @@ public class ApkProvider extends ContentProvider {
     private File resolve(Uri uri) {
         String name = uri.getLastPathSegment();
         if (name == null || name.contains("/") || name.contains("..")) return null;
-        File dir = getContext() == null ? null : getContext().getExternalFilesDir("Download");
-        if (dir == null) dir = getContext() == null ? null : getContext().getFilesDir();
+        if (getContext() == null) return null;
+        File dir = getContext().getExternalFilesDir("Download");
+        if (dir == null) dir = new File(getContext().getFilesDir(), "updates");
         if (dir == null) return null;
         return new File(dir, name);
     }
