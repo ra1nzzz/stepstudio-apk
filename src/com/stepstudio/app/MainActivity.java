@@ -22,6 +22,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -80,6 +81,13 @@ public class MainActivity extends Activity {
     private static final String KEY_DL_ID = "pending_download_id";
     private static final String KEY_DL_TAG = "pending_download_tag";
     private static final String KEY_DL_FILE = "pending_download_file";
+    private static final String KEY_DL_URL = "pending_download_url";
+    private static final String KEY_DL_MIRROR = "pending_download_mirror";
+
+    /** 直连失败时依次尝试的 GitHub 加速镜像（仅作用于 releases 下载地址） */
+    private static final String[] DL_MIRRORS = {
+            "", "https://ghfast.top/", "https://gh-proxy.com/", "https://ghproxy.net/"
+    };
 
     private static final long CHECK_INTERVAL_MS = 6L * 60L * 60L * 1000L;
     private static final long SPLASH_MIN_MS = 550L;
@@ -320,16 +328,16 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle("Step Studio")
                 .setMessage(message)
-                .setPositiveButton("检查更新", new DialogInterface.OnClickListener() {
+                .setPositiveButton("下载并安装最新版", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int w) {
-                        checkUpdate(true);
+                        checkUpdate(true, true);
                     }
                 })
-                .setNeutralButton("打开仓库", new DialogInterface.OnClickListener() {
+                .setNeutralButton("检查更新", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int w) {
-                        openExternal(REPO_URL);
+                        checkUpdate(true, false);
                     }
                 })
                 .setNegativeButton("关闭", null)
@@ -716,18 +724,19 @@ public class MainActivity extends Activity {
         ui.postDelayed(new Runnable() {
             @Override
             public void run() {
-                checkUpdate(false);
+                checkUpdate(false, false);
             }
         }, 2500L);
     }
 
-    private void checkUpdate(final boolean manual) {
+    private void checkUpdate(final boolean manual, final boolean forceInstall) {
         if (updateCheckInFlight) {
             if (manual) toast("正在检查更新…");
             return;
         }
+        if (forceInstall && !ensureInstallPermission()) return;
         updateCheckInFlight = true;
-        if (manual) toast("正在检查更新…");
+        if (manual) toast(forceInstall ? "正在获取最新版本…" : "正在检查更新…");
 
         io.execute(new Runnable() {
             @Override
@@ -776,8 +785,8 @@ public class MainActivity extends Activity {
                         public void run() {
                             updateCheckInFlight = false;
                             if (isFinishing()) return;
-                            if (newer) {
-                                onUpdateAvailable(fTag, fUrl, fName, manual);
+                            if (newer || (forceInstall && fUrl != null)) {
+                                onUpdateAvailable(fTag, fUrl, fName, manual, forceInstall);
                             } else if (manual) {
                                 toast("已是最新版本 v" + localVersionName());
                             }
@@ -801,9 +810,14 @@ public class MainActivity extends Activity {
     }
 
     private void onUpdateAvailable(final String tag, final String apkUrl, final String apkName,
-                                   boolean manual) {
+                                   boolean manual, boolean forceInstall) {
         if (!manual) {
             startApkDownload(apkUrl, apkName, tag, true);
+            return;
+        }
+        if (forceInstall) {
+            // 真机回归用：不等版本比较，直接拉最新包，装完就能验证一次完整链路
+            startApkDownload(apkUrl, apkName, tag, false);
             return;
         }
         new AlertDialog.Builder(this)
@@ -839,7 +853,8 @@ public class MainActivity extends Activity {
                     ? "StepStudio-" + tag + ".apk" : apkName;
             cleanOldUpdates(fileName);
 
-            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(apkUrl));
+            String finalUrl = mirrorUrl(apkUrl);
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(finalUrl));
             req.setTitle("Step Studio " + tag);
             req.setDescription("正在下载新版本");
             req.setMimeType("application/vnd.android.package-archive");
@@ -853,12 +868,73 @@ public class MainActivity extends Activity {
                     .putLong(KEY_DL_ID, id)
                     .putString(KEY_DL_TAG, tag)
                     .putString(KEY_DL_FILE, fileName)
+                    .putString(KEY_DL_URL, apkUrl)
                     .apply();
             registerDownloadReceiver();
-            toast(silent ? ("发现新版本 " + tag + "，正在后台下载") : ("开始下载 " + tag));
+            toast(silent ? ("发现新版本 " + tag + "，正在后台下载")
+                    : ("开始下载 " + tag + "，完成后会提示安装"));
         } catch (Exception e) {
             toast("更新下载失败：" + e.getMessage());
         }
+    }
+
+    /** 按已记录的镜像索引改写下载地址；直连（索引 0）保持原样 */
+    private String mirrorUrl(String url) {
+        int idx = prefs().getInt(KEY_DL_MIRROR, 0);
+        if (idx <= 0 || idx >= DL_MIRRORS.length) return url;
+        if (!url.startsWith("https://github.com/")) return url;
+        return DL_MIRRORS[idx] + url;
+    }
+
+    /** 下载失败时换下一个镜像重试，全部试完才放弃 */
+    private void retryWithNextMirror() {
+        String url = prefs().getString(KEY_DL_URL, null);
+        String tag = prefs().getString(KEY_DL_TAG, "");
+        String name = prefs().getString(KEY_DL_FILE, null);
+        if (TextUtils.isEmpty(url)) {
+            clearPendingDownload();
+            toast("更新下载失败，请稍后重试");
+            return;
+        }
+        int idx = prefs().getInt(KEY_DL_MIRROR, 0);
+        if (idx + 1 >= DL_MIRRORS.length) {
+            prefs().edit().putInt(KEY_DL_MIRROR, 0).apply();
+            clearPendingDownload();
+            toast("更新包下载失败，请检查网络后重试");
+            return;
+        }
+        prefs().edit().putInt(KEY_DL_MIRROR, idx + 1).apply();
+        toast("直连下载失败，正在切换加速线路重试");
+        startApkDownload(url, name, tag, false);
+    }
+
+    /** Android 8+ 需要「安装未知应用」授权，未授权时引导用户去设置 */
+    private boolean ensureInstallPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true;
+        if (getPackageManager().canRequestPackageInstalls()) return true;
+        try {
+            new AlertDialog.Builder(this)
+                    .setTitle("需要安装权限")
+                    .setMessage("下载完成后要拉起系统安装器，需要先允许 Step Studio 安装未知应用。"
+                            + "\n\n点「去开启」后打开开关，再回来重新点一次下载。")
+                    .setPositiveButton("去开启", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int w) {
+                            try {
+                                startActivity(new Intent(
+                                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                        Uri.parse("package:" + getPackageName())));
+                            } catch (Exception e) {
+                                toast("请到系统设置中开启「安装未知应用」");
+                            }
+                        }
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+        } catch (Exception e) {
+            toast("请到系统设置中开启「安装未知应用」");
+        }
+        return false;
     }
 
     private void cleanOldUpdates(String keepName) {
@@ -951,19 +1027,25 @@ public class MainActivity extends Activity {
         io.execute(new Runnable() {
             @Override
             public void run() {
+                final boolean failed = downloadFailed(downloadId);
                 final File apk = new File(updateDir(), fileName);
-                final boolean ok = apk.exists() && verifiedSameSigner(apk);
+                final boolean ok = !failed && apk.exists() && verifiedSameSigner(apk);
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
                         if (isFinishing()) return;
                         if (!ok) {
-                            clearPendingDownload();
                             //noinspection ResultOfMethodCallIgnored
                             apk.delete();
-                            toast("更新包校验失败，请到仓库重新下载");
+                            if (failed) {
+                                retryWithNextMirror();
+                            } else {
+                                clearPendingDownload();
+                                toast("更新包校验失败，已拦截安装");
+                            }
                             return;
                         }
+                        prefs().edit().putInt(KEY_DL_MIRROR, 0).apply();
                         new AlertDialog.Builder(MainActivity.this)
                                 .setTitle("新版本已就绪 " + tag)
                                 .setMessage("更新包已下载并通过签名校验。点击「立即安装」后，请在系统弹窗中确认安装。")
@@ -979,6 +1061,24 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    private boolean downloadFailed(long downloadId) {
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        DownloadManager.Query q = new DownloadManager.Query().setFilterById(downloadId);
+        android.database.Cursor c = null;
+        try {
+            c = dm.query(q);
+            if (c != null && c.moveToFirst()) {
+                int status = c.getInt(c.getColumnIndex(DownloadManager.COLUMN_STATUS));
+                return status == DownloadManager.STATUS_FAILED;
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (c != null) c.close();
+        }
     }
 
     /** 校验下载包的包名与签名，二者必须与本应用完全一致才允许安装 */
@@ -1004,25 +1104,36 @@ public class MainActivity extends Activity {
     }
 
     private void installApk(long downloadId) {
+        final String fileName = prefs().getString(KEY_DL_FILE, "");
+        File apk = TextUtils.isEmpty(fileName) ? null : new File(updateDir(), fileName);
+        if (apk == null || !apk.exists()) {
+            toast("安装包不存在，请重新下载");
+            return;
+        }
+        if (!ensureInstallPermission()) return;
+        // 优先用自带 Provider 授权读取，避免 DownloadManager uri 在部分机型上返回 null
+        try {
+            Uri local = ApkProvider.uriFor(apk);
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(local, "application/vnd.android.package-archive");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+            return;
+        } catch (Exception ignored) {
+        }
         try {
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
             Uri uri = dm.getUriForDownloadedFile(downloadId);
-            if (uri == null) {
-                File apk = new File(updateDir(), prefs().getString(KEY_DL_FILE, ""));
-                if (!apk.exists()) {
-                    toast("安装包不存在，请重试");
-                    return;
-                }
-                toast("请到文件管理安装下载目录中的更新包");
+            if (uri != null) {
+                Intent i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(uri, "application/vnd.android.package-archive");
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(i);
                 return;
             }
-            Intent i = new Intent(Intent.ACTION_VIEW);
-            i.setDataAndType(uri, "application/vnd.android.package-archive");
-            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(i);
-        } catch (Exception e) {
-            toast("无法启动安装器：" + e.getMessage());
+        } catch (Exception ignored) {
         }
+        toast("无法拉起安装器，请到文件管理安装 " + apk.getAbsolutePath());
     }
 
     private static int compareVersion(String remote, String local) {

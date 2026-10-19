@@ -18,6 +18,12 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
 
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="com.stepstudio.app.apkprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density"
