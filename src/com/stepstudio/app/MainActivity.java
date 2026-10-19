@@ -6,6 +6,7 @@ import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
+import android.content.ContentValues;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.DialogInterface;
@@ -19,6 +20,7 @@ import android.graphics.Color;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.provider.MediaStore;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
@@ -59,6 +61,9 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -92,8 +97,19 @@ public class MainActivity extends Activity {
 
     /** 直连失败时依次尝试的 GitHub 加速镜像（仅作用于 releases 下载地址） */
     private static final String[] DL_MIRRORS = {
-            "", "https://ghfast.top/", "https://gh-proxy.com/", "https://ghproxy.net/"
+            "",
+            "https://ghfast.top/",
+            "https://gh-proxy.com/",
+            "https://ghproxy.net/",
+            "https://gh.llkk.cc/",
+            "https://github.moeyy.xyz/"
     };
+
+    /** API 不通时的兜底：GitHub 的 latest/download 固定地址，不需要走 API 拿资产列表 */
+    private static final String LATEST_APK_URL =
+            "https://github.com/ra1nzzz/stepstudio-apk/releases/latest/download/StepStudio.apk";
+
+    private static final String APK_MIME = "application/vnd.android.package-archive";
 
     private static final long CHECK_INTERVAL_MS = 6L * 60L * 60L * 1000L;
     private static final long SPLASH_MIN_MS = 550L;
@@ -517,7 +533,12 @@ public class MainActivity extends Activity {
                         @Override
                         public void run() {
                             updateCheckInFlight = false;
-                            if (!isFinishing()) {
+                            if (isFinishing()) return;
+                            if (channel == 0) {
+                                // API 不通就退回 latest/download 静态地址，配合镜像重试
+                                toast("接口不通，改用静态地址下载");
+                                startApkDownload(LATEST_APK_URL, "StepStudio-latest.apk", "latest", false);
+                            } else {
                                 toast("获取版本失败：" + e.getClass().getSimpleName());
                             }
                         }
@@ -1431,29 +1452,101 @@ public class MainActivity extends Activity {
             return;
         }
         if (!ensureInstallPermission()) return;
-        // 优先用自带 Provider 授权读取，避免 DownloadManager uri 在部分机型上返回 null
-        try {
-            Uri local = ApkProvider.uriFor(apk);
-            Intent i = new Intent(Intent.ACTION_VIEW);
-            i.setDataAndType(local, "application/vnd.android.package-archive");
-            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(i);
-            return;
-        } catch (Exception ignored) {
-        }
+
+        Uri contentUri = ApkProvider.uriFor(apk);
+        String lastError = null;
+
+        // 1) ACTION_INSTALL_PACKAGE：多数 ROM 的包安装器对这条最稳
+        Exception e1 = tryLaunchInstaller(new Intent(Intent.ACTION_INSTALL_PACKAGE), contentUri);
+        if (e1 == null) return;
+        lastError = e1.getClass().getSimpleName();
+
+        // 2) ACTION_VIEW + apk mime
+        Exception e2 = tryLaunchInstaller(new Intent(Intent.ACTION_VIEW), contentUri);
+        if (e2 == null) return;
+        lastError = e2.getClass().getSimpleName();
+
+        // 3) DownloadManager 自己的 uri
         try {
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-            Uri uri = dm.getUriForDownloadedFile(downloadId);
-            if (uri != null) {
-                Intent i = new Intent(Intent.ACTION_VIEW);
-                i.setDataAndType(uri, "application/vnd.android.package-archive");
-                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(i);
-                return;
+            Uri dmUri = dm.getUriForDownloadedFile(downloadId);
+            if (dmUri != null) {
+                Exception e3 = tryLaunchInstaller(new Intent(Intent.ACTION_VIEW), dmUri);
+                if (e3 == null) return;
+                lastError = e3.getClass().getSimpleName();
             }
         } catch (Exception ignored) {
         }
-        toast("无法拉起安装器，请到文件管理安装 " + apk.getAbsolutePath());
+
+        // 4) 兜底：把包复制到公共「下载」目录，让用户自己点一次
+        String exported = exportToPublicDownloads(apk);
+        if (exported != null) {
+            toast("安装器没响应（" + lastError + "），已复制到 下载/" + apk.getName() + "，去文件管理点一下装");
+        } else {
+            toast("无法拉起安装器（" + lastError + "），请到文件管理安装 " + apk.getAbsolutePath());
+        }
+    }
+
+    private Exception tryLaunchInstaller(Intent intent, Uri uri) {
+        try {
+            intent.setDataAndType(uri, APK_MIME);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+            return null;
+        } catch (Exception e) {
+            return e;
+        }
+    }
+
+    /** 复制到公共下载目录（29+ 走 MediaStore，无需存储权限） */
+    private String exportToPublicDownloads(File apk) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentValues v = new ContentValues();
+                v.put(MediaStore.MediaColumns.DISPLAY_NAME, apk.getName());
+                v.put(MediaStore.MediaColumns.MIME_TYPE, APK_MIME);
+                v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                Uri target = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                if (target == null) return null;
+                OutputStream os = getContentResolver().openOutputStream(target);
+                if (os == null) return null;
+                copyFile(apk, os);
+                return Environment.getExternalStorageDirectory().getAbsolutePath()
+                        + "/" + Environment.DIRECTORY_DOWNLOADS + "/" + apk.getName();
+            }
+            File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            if (!dir.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                dir.mkdirs();
+            }
+            File target = new File(dir, apk.getName());
+            FileOutputStream os = new FileOutputStream(target);
+            copyFile(apk, os);
+            return target.getAbsolutePath();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void copyFile(File src, OutputStream os) throws Exception {
+        FileInputStream is = new FileInputStream(src);
+        try {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                os.write(buf, 0, n);
+            }
+            os.flush();
+        } finally {
+            try {
+                is.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                os.close();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private static int compareVersion(String remote, String local) {
