@@ -14,9 +14,9 @@
 | --- | --- |
 | 应用名 | Step Studio |
 | 包名 | com.stepstudio.app |
-| 版本 | 1.1.6（versionCode 8） |
+| 版本 | 1.1.7（versionCode 9） |
 | minSdk / targetSdk | 21 / 34（Android 5.0 起） |
-| 体积 | 约 53 KB |
+| 体积 | 约 57 KB |
 | 签名 | RSA 2048，v1 + v2 |
 
 ## 功能
@@ -29,7 +29,8 @@
 - 内置更新机制：启动时与后台定期检查 GitHub Release，发现新版本自动静默下载，签名校验通过后提示一键安装
 - 版本弹窗内「下载并安装最新版」：不等版本比较，随时拉取最新包一键下载，便于真机回归测试
 - 安装权限引导：Android 8+ 未授权「安装未知应用」时，自动弹出引导直达系统开关
-- 下载容错：GitHub 直连失败自动切换加速镜像重试；安装改由应用内 Provider 授权读取，避免部分机型 DownloadManager uri 失效
+- 下载容错：6 个 GitHub 加速镜像轮询重试（ghfast / gh-proxy / ghproxy / llkk / moeyy），接口不通时自动退回 `releases/latest/download` 静态地址
+- 安装交接四路兜底：`ACTION_INSTALL_PACKAGE` → `ACTION_VIEW` → DownloadManager uri → 复制到公共「下载」目录并提示路径；失败时把异常类型带出来便于定位
 - 长按版本胶囊打开「直装入口」：正式版（最新 Release）/ 测试包（含预发布，取列表首个）/ 自定义地址（粘贴任意 APK 链接）三条通道，下载后统一走签名校验再拉起安装
 - 测试包浮窗：页面里嗅探到 `.apk` 链接（或剪贴板里存在构建器「一键复制链接」的地址）时，右下角浮现独立「装测试包」按钮，一点即下载安装；测试包按独立应用处理，只校验是否为合法安装包，不做同签名限制
 - 返回键在网页内回退，退到底才退出应用
